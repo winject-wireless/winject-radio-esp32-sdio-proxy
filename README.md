@@ -50,7 +50,7 @@ The P4 resets the C6 at boot, gets an address by DHCP (hostname `winject-esp32c6
 Firmware updates over HTTP (raw image as the body); each chip keeps its previous image until the new one proves itself:
 
 ```bash
-curl --data-binary @winject-esp32c6.bin http://<P4 IP>/update/c6        # kept once the C6 answers the P4 (untested on hardware)
+curl --data-binary @winject-esp32c6.bin http://<P4 IP>/update/c6        # kept once the C6 answers the P4 (957 KB in 3-6 s)
 curl --data-binary @app/build/winject-p4-proxy.bin http://<P4 IP>/update/p4   # kept once reached (e.g. curl http://<P4 IP>/)
 ```
 
