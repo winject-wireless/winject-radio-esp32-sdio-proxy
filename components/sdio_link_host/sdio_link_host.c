@@ -7,6 +7,7 @@
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_heap_caps.h"
+#include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_serial_slave_link/essl_sdio.h"
 #include "freertos/FreeRTOS.h"
@@ -30,6 +31,8 @@ static sdio_link_host_config_t s_cfg;
 static sdmmc_host_t s_host;
 // Link usable: false while the C6 reboots and the bring-up is redone.
 static atomic_bool s_up;
+// C6 held in its ROM downloader: recovery neither resets nor probes it.
+static atomic_bool s_download;
 static SemaphoreHandle_t s_lock;     // essl calls are not thread-safe
 static SemaphoreHandle_t s_tx_lock;  // owns s_tx
 // The receive task outranks senders; while one waits for the bus, the receive
@@ -134,7 +137,18 @@ static void recover(void)
     const TickType_t lost_at = xTaskGetTickCount();
     int resets = 0;
     for (;;) {
+        if (atomic_load(&s_up)) {
+            return;  // reset_c6() brought it up meanwhile
+        }
+        if (atomic_load(&s_download)) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
         xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (atomic_load(&s_download) || atomic_load(&s_up)) {
+            xSemaphoreGive(s_lock);
+            continue;
+        }
         const bool quiet = (xTaskGetTickCount() - lost_at) < pdMS_TO_TICKS(RECOVER_QUIET_MS);
         if (!quiet && resets < RECOVER_MAX_RESETS) {
             resets++;
@@ -253,6 +267,25 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
         gpio_config(&io);
         gpio_set_level(config->reset_gpio, 1);
     }
+    if (config->boot_gpio >= 0 && config->boot_gpio_ldo >= 0) {
+        // Without its LDO the pad cannot drive high: the C6 then always
+        // boots into its ROM downloader.
+        static esp_ldo_channel_handle_t s_boot_ldo;
+        const esp_ldo_channel_config_t ldo = {.chan_id = config->boot_gpio_ldo, .voltage_mv = 3300};
+        esp_err_t lerr = esp_ldo_acquire_channel(&ldo, &s_boot_ldo);
+        if (lerr != ESP_OK) {
+            ESP_LOGW(TAG, "LDO_VO%d for the C6 boot strap: %s", config->boot_gpio_ldo,
+                     esp_err_to_name(lerr));
+        }
+    }
+    if (config->boot_gpio >= 0) {
+        // Driven high (normal boot) except while resetting into the
+        // downloader: released as a plain input it reads low at reset.
+        gpio_set_level(config->boot_gpio, 1);
+        gpio_config_t io = {.pin_bit_mask = 1ULL << config->boot_gpio, .mode = GPIO_MODE_OUTPUT};
+        gpio_config(&io);
+        gpio_set_level(config->boot_gpio, 1);
+    }
     pulse_reset();
 
     esp_err_t err = sdmmc_host_init();
@@ -350,9 +383,34 @@ bool sdio_link_host_is_up(void)
     return atomic_load(&s_up);
 }
 
+esp_err_t sdio_link_host_enter_download(void)
+{
+    if (s_cfg.reset_gpio < 0 || s_cfg.boot_gpio < 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    atomic_store(&s_download, true);
+    if (atomic_exchange(&s_up, false)) {
+        STAT_ADD(link_downs, 1);
+    }
+    gpio_set_level(s_cfg.boot_gpio, 0);
+    pulse_reset();
+    vTaskDelay(pdMS_TO_TICKS(100));  // strap is sampled as CHIP_PU rises
+    gpio_set_level(s_cfg.boot_gpio, 1);
+    xSemaphoreGive(s_lock);
+    ESP_LOGW(TAG, "C6 reset into its ROM downloader; link down until reset_c6");
+    return ESP_OK;
+}
+
+bool sdio_link_host_in_download(void)
+{
+    return atomic_load(&s_download);
+}
+
 esp_err_t sdio_link_host_reset_c6(uint32_t timeout_ms)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    atomic_store(&s_download, false);
     if (atomic_exchange(&s_up, false)) {
         STAT_ADD(link_downs, 1);
     }

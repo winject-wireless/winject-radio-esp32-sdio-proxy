@@ -237,20 +237,52 @@ void ota_client_confirm_p4_image(void)
     }
 }
 
+static esp_err_t c6_download(httpd_req_t *req)
+{
+    ota_client_confirm_p4_image();
+    if (xSemaphoreTake(s_busy, 0) != pdTRUE) {
+        return fail(req, "409 Conflict", "ERR an update is running (%s)\n", ESP_ERR_INVALID_STATE);
+    }
+    const esp_err_t err = sdio_link_host_enter_download();
+    xSemaphoreGive(s_busy);
+    if (err != ESP_OK) {
+        return fail(req, "500 Internal Server Error", "ERR download mode: %s\n", err);
+    }
+    return httpd_resp_sendstr(req,
+                              "OK C6 in its ROM downloader: flash it over its UART "
+                              "(esptool --before no_reset --after no_reset), then POST /c6/reset\n");
+}
+
+static esp_err_t c6_reset(httpd_req_t *req)
+{
+    ota_client_confirm_p4_image();
+    if (xSemaphoreTake(s_busy, 0) != pdTRUE) {
+        return fail(req, "409 Conflict", "ERR an update is running (%s)\n", ESP_ERR_INVALID_STATE);
+    }
+    const esp_err_t err = sdio_link_host_reset_c6(10000);
+    xSemaphoreGive(s_busy);
+    if (err != ESP_OK) {
+        return fail(req, "504 Gateway Timeout", "ERR C6 reset, not answering: %s\n", err);
+    }
+    return httpd_resp_sendstr(req, "OK C6 reset, link up\n");
+}
+
 static esp_err_t status(httpd_req_t *req)
 {
     ota_client_confirm_p4_image();
     sdio_link_host_stats_t ls;
     sdio_link_host_get_stats(&ls);
-    char msg[520];
+    char msg[768];
     snprintf(msg, sizeof(msg),
-             "winject-radio-esp32c6 P4 proxy\n"
+             "winject SDIO proxy (C6 radio)\n"
              "link=%s clock_khz=%d downs=%u ups=%u rx_msgs=%u tx_msgs=%u\n"
              "\n"
              "Update firmware (raw image as the body):\n"
-             "  curl --data-binary @c6/build/winject-esp32c6.bin http://<this address>/update/c6\n"
-             "  curl --data-binary @p4/build/winject-p4-proxy.bin http://<this address>/update/p4\n",
-             sdio_link_host_is_up() ? "up" : "down", ls.real_freq_khz, (unsigned)ls.link_downs,
+             "  curl --data-binary @winject-esp32c6.bin http://<this address>/update/c6\n"
+             "  curl --data-binary @<P4 app>.bin http://<this address>/update/p4\n"
+             "C6 ROM downloader (UART reflash): curl -X POST http://<this address>/c6/download,\n"
+             "then curl -X POST http://<this address>/c6/reset\n",
+             sdio_link_host_in_download() ? "download" : sdio_link_host_is_up() ? "up" : "down", ls.real_freq_khz, (unsigned)ls.link_downs,
              (unsigned)ls.link_ups, (unsigned)ls.rx_msgs, (unsigned)ls.tx_msgs);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, msg);
@@ -277,7 +309,12 @@ esp_err_t ota_client_start_http(uint16_t port)
     const httpd_uri_t post_p4 = {.uri = "/update/p4", .method = HTTP_POST, .handler = update_p4};
     httpd_register_uri_handler(server, &get_status);
     httpd_register_uri_handler(server, &post_c6);
+    const httpd_uri_t post_dl = {.uri = "/c6/download", .method = HTTP_POST, .handler = c6_download};
+    const httpd_uri_t post_rst = {.uri = "/c6/reset", .method = HTTP_POST, .handler = c6_reset};
     httpd_register_uri_handler(server, &post_p4);
-    ESP_LOGI(TAG, "HTTP on port %u: GET /, POST /update/c6, POST /update/p4", port);
+    httpd_register_uri_handler(server, &post_dl);
+    httpd_register_uri_handler(server, &post_rst);
+    ESP_LOGI(TAG, "HTTP on port %u: GET /, POST /update/c6, /update/p4, /c6/download, /c6/reset",
+             port);
     return ESP_OK;
 }

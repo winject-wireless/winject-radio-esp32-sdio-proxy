@@ -19,16 +19,19 @@ typedef struct {
     int clk, cmd, d0, d1, d2, d3;  // pins (used where the slot routes through the GPIO matrix)
     int freq_khz;
     int reset_gpio;      // C6 CHIP_PU, pulsed low at start; -1 = none
+    int boot_gpio;       // C6 GPIO9 strap: low during reset = ROM downloader; -1 = none
+    int boot_gpio_ldo;   // on-chip LDO powering boot_gpio's IO domain (enabled at 3.3 V); -1 = none
     int rx_task_prio;
     int rx_task_stack;
     int boot_timeout_ms; // how long to wait for the C6's slave to answer after reset
 } sdio_link_host_config_t;
 
-// Waveshare ESP32-P4-WIFI6-DEV-KIT: slot 1, CLK18 CMD19 D0-D3 14-17, C6 EN on 54.
+// Waveshare ESP32-P4-WIFI6-DEV-KIT: slot 1, CLK18 CMD19 D0-D3 14-17, C6 EN on 54,
+// C6 GPIO9 (boot strap) on 45, whose IO domain (GPIO39-48) is powered by LDO_VO4.
 #define SDIO_LINK_HOST_CONFIG_DEFAULT()                                                     \
     {                                                                                       \
         .slot = 1, .clk = 18, .cmd = 19, .d0 = 14, .d1 = 15, .d2 = 16, .d3 = 17,            \
-        .freq_khz = 20000, .reset_gpio = 54, .rx_task_prio = 20, .rx_task_stack = 4096,     \
+        .freq_khz = 20000, .reset_gpio = 54, .boot_gpio = 45, .boot_gpio_ldo = 4, .rx_task_prio = 20, .rx_task_stack = 4096,     \
         .boot_timeout_ms = 5000,                                                            \
     }
 
@@ -58,6 +61,15 @@ esp_err_t sdio_link_host_reset_c6(uint32_t timeout_ms);
 // re-establishes the link. A C6 that stays silent is reset only after 30 s and
 // at most 3 times (so it can be reflashed over its UART meanwhile).
 bool sdio_link_host_is_up(void);
+
+// Reset the C6 into its ROM downloader (GPIO9 held low through the CHIP_PU
+// pulse) for reflashing over its UART, e.g. when it has no bootable image.
+// The link stays down and recovery leaves the C6 alone until
+// sdio_link_host_reset_c6(), which boots it normally again.
+esp_err_t sdio_link_host_enter_download(void);
+
+// true between sdio_link_host_enter_download() and the next reset_c6().
+bool sdio_link_host_in_download(void);
 
 // Send one message to the C6. Fails with ESP_ERR_INVALID_STATE while the link
 // is down. Blocks up to `timeout_ms` for a free slave

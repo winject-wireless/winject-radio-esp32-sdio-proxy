@@ -12,8 +12,8 @@ The SDIO message format, bring-up and proxy behaviour are specified in winject-r
 ## Layout
 
 ```
-components/sdio_link_host/   SDIO host link: resets the C6 (CHIP_PU), receive task, send, link recovery
-components/winject_proxy/    UDP 22 / 9000 <-> SDIO; HTTP GET /, POST /update/c6, POST /update/p4
+components/sdio_link_host/   SDIO host link: resets the C6 (CHIP_PU, boot strap), receive task, send, link recovery
+components/winject_proxy/    UDP 22 / 9000 <-> SDIO; HTTP GET /, POST /update/c6, /update/p4, /c6/download, /c6/reset
 cmake/winject_sdio_proxy.cmake  Fetches sdio_msg; sets WINJECT_SDIO_PROXY_COMPONENT_DIRS
 app/                         Standalone proxy image: Ethernet (IP101, DHCP) + winject_proxy
 ```
@@ -54,7 +54,15 @@ curl --data-binary @winject-esp32c6.bin http://<P4 IP>/update/c6        # kept o
 curl --data-binary @app/build/winject-p4-proxy.bin http://<P4 IP>/update/p4   # kept once reached (e.g. curl http://<P4 IP>/)
 ```
 
-The link waits 30 s before resetting a silent C6 (at most 3 times), so the C6 can be reflashed over its UART while the P4 runs.
+To reflash the C6 over its UART (first flash, or no bootable image), the P4 resets it into its ROM downloader by holding its GPIO9 strap low (P4 GPIO45) through the CHIP_PU pulse:
+
+```bash
+curl -X POST http://<P4 IP>/c6/download
+python -m esptool --chip esp32c6 -p <C6 UART> --before no_reset --after no_reset write_flash @flash_args
+curl -X POST http://<P4 IP>/c6/reset      # normal boot, link up again
+```
+
+GPIO45 is in the P4's GPIO39–48 IO domain, powered by the on-chip LDO_VO4; `sdio_link_host` enables it at 3.3 V and drives GPIO45 high, otherwise the strap reads low and the C6 boots into the downloader on every reset. A silent C6 is otherwise reset only after 30 s (at most 3 times), so it can also be reflashed over its UART while the P4 runs.
 
 ## Open issues
 
