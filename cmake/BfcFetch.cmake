@@ -1,9 +1,9 @@
 include(FetchContent)
 
-# Header-only; only src/bfc is used (queue registrar on master).
+# Header-only; only src/bfc is used (object_registry on master).
 FetchContent_Declare(bfc
     GIT_REPOSITORY https://github.com/therooftopprinz/BFC.git
-    GIT_TAG 4b29fcc2f2932ebe6a73087af70def3b36286520
+    GIT_TAG ae9bd7637a730ef64f24a21fe99fe7eb8fa3fcb6
 )
 FetchContent_GetProperties(bfc)
 if(NOT bfc_POPULATED)
