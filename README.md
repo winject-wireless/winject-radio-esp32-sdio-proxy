@@ -35,7 +35,11 @@ list(APPEND EXTRA_COMPONENT_DIRS ${WINJECT_SDIO_PROXY_COMPONENT_DIRS})
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 ```
 
-Then `PRIV_REQUIRES winject_proxy` and call `winject_proxy_start(&cfg)` with `WINJECT_PROXY_CONFIG_DEFAULT()` once the network is up. `POST /update/p4` needs a two-slot partition table with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (see `app/`). To build against local checkouts, pass `-DFETCHCONTENT_SOURCE_DIR_WINJECT_SDIO_PROXY=<dir>` and `-DFETCHCONTENT_SOURCE_DIR_WINJECT_RADIO_ESP32C6=<dir>`.
+Then `PRIV_REQUIRES winject_proxy` and call `winject_proxy_start(&cfg)` with `WINJECT_PROXY_CONFIG_DEFAULT()` once the network is up.
+
+### Queue d-plane
+
+When winject-l3 runs on the same P4, the d-plane can skip lwIP: set `cfg.dplane_tx_queue`, `cfg.dplane_rx_queue` and `cfg.dplane_reactor` and the proxy uses two in-process bfc queues instead of UDP 9000 (the m-plane stays on UDP 22). The host registers both `bfc::reactive_circular_lossy_queue<bfc::shared_sized_buffer>` in `bfc::cv_reactor_circular_lossy_queue_registry`, a `bfc::cv_reactor<>` in `bfc::cv_reactor_registry`, runs the reactor, then starts the proxy and winject-l3 with the same names (`radio.dplane_tx`, `radio.dplane_rx`, `radio.reactor`). The proxy consumes `dplane_tx_queue` (inject MPDUs and registrations, sent to the C6 by the d-plane task, never on the reactor thread) and pushes every C6 frame to `dplane_rx_queue`. Each queue's producer counts what a full queue evicts: the proxy as `dplane_up_evicted` (`dup_evict`), winject-l3 as `radio_tx_drops`. The binding is for the life of the program. bfc is pinned in `cmake/BfcFetch.cmake`; FetchContent keeps the first declaration, so keep it equal to winject-l3's and vstreamer's. `POST /update/p4` needs a two-slot partition table with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (see `app/`). To build against local checkouts, pass `-DFETCHCONTENT_SOURCE_DIR_WINJECT_SDIO_PROXY=<dir>` and `-DFETCHCONTENT_SOURCE_DIR_WINJECT_RADIO_ESP32C6=<dir>`.
 
 ## Standalone image
 
