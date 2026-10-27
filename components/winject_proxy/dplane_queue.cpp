@@ -1,5 +1,6 @@
 #include "dplane_queue.h"
 
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -7,6 +8,11 @@
 #include <bfc/cv_reactor.hpp>
 #include <bfc/event_queue.hpp>
 #include <bfc/shared_sized_buffer.hpp>
+
+#include "sdkconfig.h"
+#ifdef CONFIG_WINJECT_PROXY_DPLANE_PSRAM
+#include "esp_heap_caps.h"
+#endif
 
 namespace {
 
@@ -99,7 +105,17 @@ bool dplane_queue_push(const uint8_t *data, size_t len)
     if (!forward || !cv) {
         return false;
     }
+#ifdef CONFIG_WINJECT_PROXY_DPLANE_PSRAM
+    auto *bytes = static_cast<std::byte *>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!bytes) {
+        return true;  // dropped: counted the same as an eviction
+    }
+    std::memcpy(bytes, data, len);
+    const size_t before =
+        forward->push(bfc::shared_sized_buffer::adopt(bytes, len, len, [](std::byte *p) { heap_caps_free(p); }));
+#else
     const size_t before = forward->push(bfc::shared_sized_buffer::copy_from(data, len));
+#endif
     const size_t capacity = forward->capacity();
     cv->wake_up();
     return capacity != 0 && before >= capacity;
