@@ -66,6 +66,13 @@ python -m esptool --chip esp32c6 -p <C6 UART> --before no_reset --after no_reset
 curl -X POST http://<P4 IP>/c6/reset      # normal boot, link up again
 ```
 
+The strap pin depends on the board (`sdio_link_host_config_t`):
+
+| Board | C6 `GPIO9` | `boot_gpio_ldo` | C6 `U0RXD` / `U0TXD` |
+|---|---|---|---|
+| Guition JC-ESP32P4-M3-DEV | GPIO45 (JP1 pin 24 jumper), the default | 4 (LDO_VO4) | GPIO32 / GPIO33 (JP1 20 / 22 jumpers) |
+| Waveshare ESP32-P4-WIFI6-DEV-KIT | GPIO22 | -1 | GPIO33 / GPIO32 |
+
 GPIO45 is in the P4's GPIO39–48 IO domain, powered by the on-chip LDO_VO4; `sdio_link_host` enables it at 3.3 V and drives GPIO45 high, otherwise the strap reads low and the C6 boots into the downloader on every reset. A silent C6 is otherwise reset only after 30 s (at most 3 times), so it can also be reflashed over its UART while the P4 runs.
 
 ## Open issues

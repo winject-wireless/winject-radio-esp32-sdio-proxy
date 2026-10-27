@@ -26,8 +26,11 @@ typedef struct {
     int boot_timeout_ms; // how long to wait for the C6's slave to answer after reset
 } sdio_link_host_config_t;
 
-// Waveshare ESP32-P4-WIFI6-DEV-KIT: slot 1, CLK18 CMD19 D0-D3 14-17, C6 EN on 54,
-// C6 GPIO9 (boot strap) on 45, whose IO domain (GPIO39-48) is powered by LDO_VO4.
+// P4 + C6 boards (Waveshare ESP32-P4-WIFI6-DEV-KIT, Guition JC-ESP32P4-M3-DEV):
+// slot 1, CLK18 CMD19 D0-D3 14-17, C6 EN on 54. C6 GPIO9 (boot strap) on 45 is
+// the Guition's jumper; its IO domain (GPIO39-48) is powered by LDO_VO4. The
+// Waveshare wires the strap to GPIO22 instead: set boot_gpio = 22,
+// boot_gpio_ldo = -1.
 #define SDIO_LINK_HOST_CONFIG_DEFAULT()                                                     \
     {                                                                                       \
         .slot = 1, .clk = 18, .cmd = 19, .d0 = 14, .d1 = 15, .d2 = 16, .d3 = 17,            \
