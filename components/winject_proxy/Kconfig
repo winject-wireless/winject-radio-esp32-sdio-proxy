@@ -1,0 +1,14 @@
+menu "winject SDIO proxy"
+
+config WINJECT_PROXY_DPLANE_PSRAM
+    bool "Copy queue d-plane RX frames into PSRAM"
+    depends on SPIRAM
+    default n
+    help
+        dplane_queue_push() copies each radio frame out of the SDIO buffer
+        before forwarding it. With this on, the copy goes to PSRAM instead of
+        internal RAM, so an app that holds frames for long (FEC, several
+        outputs) does not use up the internal RAM that drivers need. A frame
+        whose PSRAM allocation fails is dropped.
+
+endmenu
