@@ -5,7 +5,7 @@ include(FetchContent)
 # also builds winject-l3 or vstreamer keep this pin equal to theirs.
 FetchContent_Declare(bfc
     GIT_REPOSITORY https://github.com/therooftopprinz/BFC.git
-    GIT_TAG 6c02a495d1a2cf4a8a13dfa6b25b342780527c89
+    GIT_TAG f6fe9784bb8379eaa72a1597fe9e9638b97fb5fe
 )
 FetchContent_GetProperties(bfc)
 if(NOT bfc_POPULATED)
