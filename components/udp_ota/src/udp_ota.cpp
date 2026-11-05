@@ -31,6 +31,9 @@ namespace
 const char* TAG = "udp_ota";
 
 udp_ota_config_t g_cfg;
+/* sdio_link_host_start() succeeded (udp_ota_c6_link_started): before that the
+ * link host's locks do not exist, so the C6 target and controls stay off. */
+std::atomic<bool> g_c6_link {false};
 
 void set_active(bool on)
 {
@@ -284,6 +287,11 @@ public:
 
     bool begin() override
     {
+        if (!g_c6_link.load())
+        {
+            ESP_LOGE(TAG, "c6: the SDIO link was never started");
+            return false;
+        }
         /* The staging slot holds the P4's previous image while the running one
          * is unconfirmed: overwriting it would remove the P4's rollback. */
         esp_ota_img_states_t st;
@@ -361,6 +369,7 @@ public:
             std::snprintf(line, sizeof(line), "c6=writing c6_written=%u/%u", (unsigned)m_written.load(),
                           (unsigned)m_size);
             break;
+        case state_staging: std::snprintf(line, sizeof(line), "c6=staging"); break;
         case state_ok: std::snprintf(line, sizeof(line), "c6=ok"); break;
         case state_failed: std::snprintf(line, sizeof(line), "c6=failed c6_err=%s", esp_err_to_name(m_err)); break;
         default:
@@ -374,11 +383,19 @@ public:
 
     status reset() override
     {
+        if (!g_c6_link.load())
+        {
+            return status::enoent;
+        }
         return sdio_link_host_reset_c6(10000) == ESP_OK ? status::ok : status::eio;
     }
 
     status download() override
     {
+        if (!g_c6_link.load())
+        {
+            return status::enoent;
+        }
         return sdio_link_host_enter_download() == ESP_OK ? status::ok : status::eio;
     }
 
@@ -401,13 +418,14 @@ private:
     void run_write()
     {
         /* Video (or whatever the host pauses) stays off while the C6 flashes:
-         * its radio stalls on every flash write anyway. */
-        set_active(true);
+         * its radio stalls on every flash write anyway. The server's
+         * on_active(true) from the ota_start still holds (active_filter keeps
+         * its false back while this runs); this task ends it. */
         const int64_t t0 = esp_timer_get_time();
         const esp_err_t err = write_c6();
-        set_active(false);
         m_err = err;
         m_state.store(err == ESP_OK ? state_ok : state_failed);
+        set_active(false);
         printf("UDP_OTA c6 %s: %u B in %lld ms\n", err == ESP_OK ? "updated" : esp_err_to_name(err),
                (unsigned)m_size, (long long)((esp_timer_get_time() - t0) / 1000));
     }
@@ -468,6 +486,19 @@ private:
     esp_err_t m_err = ESP_OK;
 };
 
+c6_radio g_c6;
+
+/* The server's on_active, with its false held back while the C6 write runs:
+ * one true ... false pair per image, false only from the write task. */
+void active_filter(bool on)
+{
+    if (!on && g_c6.busy())
+    {
+        return;
+    }
+    set_active(on);
+}
+
 uint32_t now_ms()
 {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
@@ -482,10 +513,8 @@ void server_task(void* arg)
 {
     const int fd = static_cast<task_args*>(arg)->fd;
     static p4_app app;
-    static c6_radio c6;
     static posix_file_store files(g_cfg.fs_dir ? g_cfg.fs_dir : "");
-    server srv(app, g_cfg.idle_timeout_ms, [](bool on) { set_active(on); }, g_cfg.fs_dir ? &files : nullptr, &c6,
-               &c6);
+    server srv(app, g_cfg.idle_timeout_ms, active_filter, g_cfg.fs_dir ? &files : nullptr, &g_c6, &g_c6);
     static uint8_t req[1600];
     static uint8_t reply[server::k_reply_max];
     for (;;)
@@ -570,6 +599,11 @@ extern "C" void udp_ota_on_c6_reply(const uint8_t* payload, uint16_t len)
     }
     std::memcpy(&r, payload, sizeof(r));
     xQueueSend(udp_ota::g_c6_replies, &r, 0);
+}
+
+extern "C" void udp_ota_c6_link_started(void)
+{
+    udp_ota::g_c6_link.store(true);
 }
 
 extern "C" void udp_ota_confirm_p4_image(void)

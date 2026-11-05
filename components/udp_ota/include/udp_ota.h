@@ -42,6 +42,10 @@ typedef struct {
 // SDIO link delivers OTA-plane replies (udp_ota_on_c6_reply).
 esp_err_t udp_ota_start(const udp_ota_config_t *config);
 
+// sdio_link_host_start() succeeded: the C6 target and c6_reset /
+// c6_download work from now on (ENOENT before).
+void udp_ota_c6_link_started(void);
+
 // The SDIO link receive task: an OTA-plane reply from the C6.
 void udp_ota_on_c6_reply(const uint8_t *payload, uint16_t len);
 

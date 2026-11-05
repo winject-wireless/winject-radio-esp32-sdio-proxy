@@ -274,6 +274,7 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
         ESP_LOGE(TAG, "SDIO link: 0x%x", err);
         return err;
     }
+    udp_ota_c6_link_started();
     if (xTaskCreate(mplane_task, "proxy_mplane", 4096, NULL, config->mplane_task_prio, NULL) != pdPASS ||
         (!queue && xTaskCreate(dplane_task, "proxy_dplane", 4096, NULL, config->dplane_task_prio, NULL) != pdPASS)) {
         return ESP_ERR_NO_MEM;
