@@ -234,6 +234,19 @@ static esp_err_t start_dplane_queue(const winject_proxy_config_t *config)
 esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
 {
     s_cfg = *config;
+    if (config->ota_port) {
+        // First: an update path survives whatever fails below (sockets, queue
+        // d-plane, the link), and the link routes the C6's OTA-plane replies to it.
+        udp_ota_config_t ota = UDP_OTA_CONFIG_DEFAULT();
+        ota.port = config->ota_port;
+        ota.fs_dir = config->ota_fs_dir;
+        ota.on_active = config->on_ota_active;
+        ota.ctx = config->ota_ctx;
+        esp_err_t oerr = udp_ota_start(&ota);
+        if (oerr != ESP_OK) {
+            ESP_LOGE(TAG, "udp_ota on %u: %s", config->ota_port, esp_err_to_name(oerr));
+        }
+    }
     const bool queue = config->dplane_tx_queue || config->dplane_rx_queue || config->dplane_reactor;
     mplane_router_init(&s_mplane_router);
     s_mplane_router_mu = xSemaphoreCreateMutex();
@@ -254,18 +267,6 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
         s_dplane_fd = bind_udp(config->dplane_port, 64 * 1024);
         if (s_dplane_fd < 0) {
             return ESP_FAIL;
-        }
-    }
-    if (config->ota_port) {
-        // Before the link starts: it routes the C6's OTA-plane replies to udp_ota.
-        udp_ota_config_t ota = UDP_OTA_CONFIG_DEFAULT();
-        ota.port = config->ota_port;
-        ota.fs_dir = config->ota_fs_dir;
-        ota.on_active = config->on_ota_active;
-        ota.ctx = config->ota_ctx;
-        esp_err_t oerr = udp_ota_start(&ota);
-        if (oerr != ESP_OK) {
-            ESP_LOGE(TAG, "udp_ota on %u: %s", config->ota_port, esp_err_to_name(oerr));
         }
     }
     esp_err_t err = sdio_link_host_start(&config->link, on_link_message, NULL);
