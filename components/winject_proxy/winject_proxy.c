@@ -7,7 +7,7 @@
 #include "dplane_queue.h"
 #include "esp_log.h"
 #include "mplane_route.h"
-#include "ota_client.h"
+#include "udp_ota.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -85,7 +85,7 @@ static void send_mplane_reply(void *ctx, const struct sockaddr_in *to, const uin
 static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, uint16_t len)
 {
     if (plane == SDIO_MSG_PLANE_OTA) {
-        ota_client_on_reply(payload, len);
+        udp_ota_on_c6_reply(payload, len);
         return;
     }
     if (plane == SDIO_MSG_PLANE_MPLANE) {
@@ -131,7 +131,7 @@ static void mplane_task(void *arg)
         if (n <= 0) {
             continue;
         }
-        ota_client_confirm_p4_image();
+        udp_ota_confirm_p4_image();
         // Each command line gets a proxy id, so its reply finds this sender.
         xSemaphoreTake(s_mplane_router_mu, portMAX_DELAY);
         const int len = mplane_route_request(&s_mplane_router, &from, buf, (size_t)n, request, sizeof(request),
@@ -161,7 +161,7 @@ static void dplane_task(void *arg)
         if (n <= 0) {
             continue;
         }
-        ota_client_confirm_p4_image();
+        udp_ota_confirm_p4_image();
         if (n <= REGISTRATION_MAX) {
             if (!atomic_load(&s_dplane_peer_set) || s_dplane_peer.sin_addr.s_addr != from.sin_addr.s_addr ||
                 s_dplane_peer.sin_port != from.sin_port) {
@@ -256,10 +256,16 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
             return ESP_FAIL;
         }
     }
-    if (config->http_port) {
-        esp_err_t herr = ota_client_start_http(config->http_port);
-        if (herr != ESP_OK) {
-            ESP_LOGE(TAG, "HTTP server: 0x%x", herr);
+    if (config->ota_port) {
+        // Before the link starts: it routes the C6's OTA-plane replies to udp_ota.
+        udp_ota_config_t ota = UDP_OTA_CONFIG_DEFAULT();
+        ota.port = config->ota_port;
+        ota.fs_dir = config->ota_fs_dir;
+        ota.on_active = config->on_ota_active;
+        ota.ctx = config->ota_ctx;
+        esp_err_t oerr = udp_ota_start(&ota);
+        if (oerr != ESP_OK) {
+            ESP_LOGE(TAG, "udp_ota on %u: %s", config->ota_port, esp_err_to_name(oerr));
         }
     }
     esp_err_t err = sdio_link_host_start(&config->link, on_link_message, NULL);
