@@ -77,5 +77,9 @@ GPIO45 is in the P4's GPIO39–48 IO domain, powered by the on-chip LDO_VO4; `sd
 
 ## Open issues
 
-- **Proxy addressing:** m-plane replies go to the source of the most recent request (one m-plane client at a time), and any 1–23 byte datagram on UDP 9000 re-targets where received frames go. Both match the Ethernet radio, but the proxy accepts them from anywhere on the LAN.
+- **Proxy addressing:** any 1–23 byte datagram on UDP 9000 re-targets where received frames go. This matches the Ethernet radio, but the proxy accepts it from anywhere on the LAN, as it does m-plane requests.
+
+## m-plane clients
+
+Several clients can use UDP 22 at once (for example winject-l3 on the same P4 and an operator over an L3 upstream). The C6 runs one request line at a time and tags each reply line with the request's `cmd:<u8>`, so the proxy routes by tag ([`mplane_route.c`](components/winject_proxy/mplane_route.c)): it gives every command line an unused id (`cmd:<id> `, 1–255), remembers the sender and the sender's own tag, and on each `OK:<id>` / `NOK:<id>` reply line puts that tag back and sends the line to that sender. An id stays reserved until the ordered C6 reply stream advances to the next id; a request is dropped rather than overwrite an outstanding route if all ids are busy. Clients that tag get their own ids back unchanged. Untagged clients get untagged replies, but every reply line then starts with `OK` or `NOK` (the C6 decorates body lines of tagged requests that way). Blank and `#` lines and lines with a malformed `cmd:` prefix go to the C6 unchanged, and its untagged reply goes to the most recent sender. Run the host sanitizer test with [`test/run.sh`](test/run.sh).
 - **Network settings:** DHCP only; the address cannot be set over the m-plane (`network` replies `NOK ENOTSUP` on the C6) and there is no static fallback.

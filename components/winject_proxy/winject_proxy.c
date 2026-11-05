@@ -6,8 +6,10 @@
 
 #include "dplane_queue.h"
 #include "esp_log.h"
+#include "mplane_route.h"
 #include "ota_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 
@@ -25,10 +27,18 @@ static int s_dplane_fd = -1;
 static bool s_dplane_queue;
 static TaskHandle_t s_dplane_queue_task;
 
-// Reply / forward destinations. Written by the UDP tasks, read by the link
+// The C6 keeps at most this much of a request (k_request_max - 1).
+#define C6_REQUEST_MAX 1499
+// One reply datagram: a C6 message plus restored tags (up to 2 bytes a line).
+#define MPLANE_REPLY_DATAGRAM_MAX 1600
+
+// m-plane request ids -> UDP senders, so several clients share the C6. Used by
+// the m-plane task (requests) and the link receive task (replies).
+static mplane_router_t s_mplane_router;
+static SemaphoreHandle_t s_mplane_router_mu;
+
+// d-plane forward destination. Written by the UDP task, read by the link
 // receive task; a torn read only misdirects one datagram during a change.
-static struct sockaddr_in s_mplane_peer;
-static atomic_bool s_mplane_peer_set;
 static struct sockaddr_in s_dplane_peer;
 static atomic_bool s_dplane_peer_set;
 
@@ -62,6 +72,15 @@ static int bind_udp(uint16_t port, int rcvbuf)
     return fd;
 }
 
+static void send_mplane_reply(void *ctx, const struct sockaddr_in *to, const uint8_t *data, size_t len)
+{
+    if (sendto(s_mplane_fd, data, len, 0, (const struct sockaddr *)to, sizeof(*to)) == (int)len) {
+        STAT_INC(mplane_replies);
+    } else {
+        STAT_INC(mplane_dropped);
+    }
+}
+
 // Link receive task: a message from the C6.
 static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, uint16_t len)
 {
@@ -70,14 +89,13 @@ static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, ui
         return;
     }
     if (plane == SDIO_MSG_PLANE_MPLANE) {
-        if (!atomic_load(&s_mplane_peer_set)) {
-            STAT_INC(mplane_dropped);
-            return;
-        }
-        struct sockaddr_in to = s_mplane_peer;
-        if (sendto(s_mplane_fd, payload, len, 0, (struct sockaddr *)&to, sizeof(to)) == len) {
-            STAT_INC(mplane_replies);
-        } else {
+        // Only the link receive task gets here.
+        static uint8_t datagram[MPLANE_REPLY_DATAGRAM_MAX];
+        xSemaphoreTake(s_mplane_router_mu, portMAX_DELAY);
+        const size_t dropped = mplane_route_reply(&s_mplane_router, payload, len, datagram, sizeof(datagram),
+                                                  send_mplane_reply, NULL);
+        xSemaphoreGive(s_mplane_router_mu);
+        for (size_t i = 0; i < dropped; ++i) {
             STAT_INC(mplane_dropped);
         }
         return;
@@ -104,6 +122,8 @@ static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, ui
 static void mplane_task(void *arg)
 {
     static uint8_t buf[DATAGRAM_MAX];
+    static uint8_t request[C6_REQUEST_MAX];
+    static mplane_route_batch_t batch;
     for (;;) {
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
@@ -112,13 +132,22 @@ static void mplane_task(void *arg)
             continue;
         }
         ota_client_confirm_p4_image();
-        s_mplane_peer = from;
-        atomic_store(&s_mplane_peer_set, true);
-        if (sdio_link_host_send(SDIO_MSG_PLANE_MPLANE, buf, n, 1000) == ESP_OK) {
+        // Each command line gets a proxy id, so its reply finds this sender.
+        xSemaphoreTake(s_mplane_router_mu, portMAX_DELAY);
+        const int len = mplane_route_request(&s_mplane_router, &from, buf, (size_t)n, request, sizeof(request),
+                                             &batch);
+        if (len <= 0) {
+            xSemaphoreGive(s_mplane_router_mu);
+            STAT_INC(mplane_dropped);  // too long once tagged, or empty
+            continue;
+        }
+        if (sdio_link_host_send(SDIO_MSG_PLANE_MPLANE, request, (uint16_t)len, 1000) == ESP_OK) {
             STAT_INC(mplane_requests);
         } else {
+            mplane_route_cancel_request(&s_mplane_router, &batch);
             STAT_INC(mplane_dropped);
         }
+        xSemaphoreGive(s_mplane_router_mu);
     }
 }
 
@@ -206,6 +235,11 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
 {
     s_cfg = *config;
     const bool queue = config->dplane_tx_queue || config->dplane_rx_queue || config->dplane_reactor;
+    mplane_router_init(&s_mplane_router);
+    s_mplane_router_mu = xSemaphoreCreateMutex();
+    if (s_mplane_router_mu == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     s_mplane_fd = bind_udp(config->mplane_port, 16 * 1024);
     if (s_mplane_fd < 0) {
         return ESP_FAIL;
