@@ -4,7 +4,7 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/BfcFetch.cmake)
 endif()
 
-idf_component_register(SRCS "winject_proxy.c" "ota_client.c" "dplane_queue.cpp"
+idf_component_register(SRCS "winject_proxy.c" "mplane_route.c" "ota_client.c" "dplane_queue.cpp"
                        INCLUDE_DIRS "include"
                        PRIV_INCLUDE_DIRS ${bfc_SOURCE_DIR}/src
                        REQUIRES sdio_link_host
