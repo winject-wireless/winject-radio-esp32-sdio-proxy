@@ -297,11 +297,23 @@ def status_field(text, key):
     return None
 
 
-def wait_for_image(client, elf, timeout_s, settle_s=10, log=print):
-    """Waits until the P4 runs the image with this ELF SHA and has confirmed it
-    (state=valid), then checks again after settle_s: about half of P4 OTAs
-    used to reset at first boot and roll back, and a pending image that
-    resets is rolled back by the bootloader."""
+def same_elf(reported, image_elf):
+    """The P4 reports the first CONFIG_APP_RETRIEVE_LEN_ELF_SHA hex digits of
+    its ELF SHA-256 (9 by default), the image gives 16: compare the common
+    prefix (at least 8 digits)."""
+    if not reported or not image_elf:
+        return False
+    n = min(len(reported), len(image_elf))
+    return n >= 8 and reported[:n] == image_elf[:n]
+
+
+def wait_for_image(client, elf, timeout_s, settle_s=10, log=print, old_slot=None):
+    """Waits until the P4 runs the image with this ELF SHA from the slot it
+    was written to (not old_slot, the slot running before the update) and has
+    confirmed it (state=valid), then checks again after settle_s: about half
+    of P4 OTAs used to reset at first boot and roll back, and a pending image
+    that resets is rolled back by the bootloader. The slot check also catches
+    a rollback to an identical image, which the ELF check cannot."""
     deadline = time.monotonic() + timeout_s
     time.sleep(2)
     last = None
@@ -313,14 +325,18 @@ def wait_for_image(client, elf, timeout_s, settle_s=10, log=print):
         if st != last:
             log("status: " + st)
             last = st
-        if elf is not None and status_field(st, "elf") != elf:
+        if elf is not None and not same_elf(status_field(st, "elf"), elf):
             raise OtaError("P4 answers with another image (rolled back?), want elf=%s" % elf)
+        if old_slot is not None and status_field(st, "running") == old_slot:
+            raise OtaError("P4 still runs from %s, the slot it ran before the update (rolled back?)" % old_slot)
         if status_field(st, "state") != "valid":
             time.sleep(0.5)
             continue
         time.sleep(settle_s)
         st = client.status()
-        if elf is not None and status_field(st, "elf") != elf:
+        if (elf is not None and not same_elf(status_field(st, "elf"), elf)) or (
+            old_slot is not None and status_field(st, "running") == old_slot
+        ):
             raise OtaError("image was running but the P4 rolled back: " + st)
         log("confirmed: " + st)
         return st
@@ -414,7 +430,7 @@ def main():
             if args.reboot:
                 client.reboot()
                 print("rebooting")
-                wait_for_image(client, elf, args.boot_timeout)
+                wait_for_image(client, elf, args.boot_timeout, old_slot=status_field(before, "running"))
     except OtaError as e:
         print("ERROR " + str(e), file=sys.stderr)
         return 1
