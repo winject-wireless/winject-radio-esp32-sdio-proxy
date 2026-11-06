@@ -7,7 +7,7 @@
 #include "dplane_queue.h"
 #include "esp_log.h"
 #include "mplane_route.h"
-#include "ota_client.h"
+#include "udp_ota.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -85,7 +85,7 @@ static void send_mplane_reply(void *ctx, const struct sockaddr_in *to, const uin
 static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, uint16_t len)
 {
     if (plane == SDIO_MSG_PLANE_OTA) {
-        ota_client_on_reply(payload, len);
+        udp_ota_on_c6_reply(payload, len);
         return;
     }
     if (plane == SDIO_MSG_PLANE_MPLANE) {
@@ -131,7 +131,7 @@ static void mplane_task(void *arg)
         if (n <= 0) {
             continue;
         }
-        ota_client_confirm_p4_image();
+        udp_ota_confirm_p4_image();
         // Each command line gets a proxy id, so its reply finds this sender.
         xSemaphoreTake(s_mplane_router_mu, portMAX_DELAY);
         const int len = mplane_route_request(&s_mplane_router, &from, buf, (size_t)n, request, sizeof(request),
@@ -161,7 +161,7 @@ static void dplane_task(void *arg)
         if (n <= 0) {
             continue;
         }
-        ota_client_confirm_p4_image();
+        udp_ota_confirm_p4_image();
         if (n <= REGISTRATION_MAX) {
             if (!atomic_load(&s_dplane_peer_set) || s_dplane_peer.sin_addr.s_addr != from.sin_addr.s_addr ||
                 s_dplane_peer.sin_port != from.sin_port) {
@@ -234,6 +234,19 @@ static esp_err_t start_dplane_queue(const winject_proxy_config_t *config)
 esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
 {
     s_cfg = *config;
+    if (config->ota_port) {
+        // First: an update path survives whatever fails below (sockets, queue
+        // d-plane, the link), and the link routes the C6's OTA-plane replies to it.
+        udp_ota_config_t ota = UDP_OTA_CONFIG_DEFAULT();
+        ota.port = config->ota_port;
+        ota.fs_dir = config->ota_fs_dir;
+        ota.on_active = config->on_ota_active;
+        ota.ctx = config->ota_ctx;
+        esp_err_t oerr = udp_ota_start(&ota);
+        if (oerr != ESP_OK) {
+            ESP_LOGE(TAG, "udp_ota on %u: %s", config->ota_port, esp_err_to_name(oerr));
+        }
+    }
     const bool queue = config->dplane_tx_queue || config->dplane_rx_queue || config->dplane_reactor;
     mplane_router_init(&s_mplane_router);
     s_mplane_router_mu = xSemaphoreCreateMutex();
@@ -256,17 +269,12 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
             return ESP_FAIL;
         }
     }
-    if (config->http_port) {
-        esp_err_t herr = ota_client_start_http(config->http_port);
-        if (herr != ESP_OK) {
-            ESP_LOGE(TAG, "HTTP server: 0x%x", herr);
-        }
-    }
     esp_err_t err = sdio_link_host_start(&config->link, on_link_message, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SDIO link: 0x%x", err);
         return err;
     }
+    udp_ota_c6_link_started();
     if (xTaskCreate(mplane_task, "proxy_mplane", 4096, NULL, config->mplane_task_prio, NULL) != pdPASS ||
         (!queue && xTaskCreate(dplane_task, "proxy_dplane", 4096, NULL, config->dplane_task_prio, NULL) != pdPASS)) {
         return ESP_ERR_NO_MEM;

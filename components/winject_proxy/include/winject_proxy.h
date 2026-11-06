@@ -15,13 +15,15 @@
 //                       winject-l3 on the same P4 (its radio.dplane_tx /
 //                       radio.dplane_rx / radio.reactor). Every C6 message
 //                       goes to dplane_rx_queue; no registration is needed.
-//   HTTP (http_port):   GET / status; POST /update/c6 with the raw C6 image
-//                       (curl --data-binary @winject-esp32c6.bin) streams it
-//                       to the C6 over the OTA plane, resets the C6 and checks
-//                       the new image answers. POST /update/p4 updates the P4
-//                       itself (needs a two-slot partition table); the new
-//                       image is kept once it is reached over the network.
+//   udp_ota (ota_port, default 3232; components/udp_ota, tools/udp_ota.py):
+//                       updates this P4's app and the C6's (staged on the P4,
+//                       then written to the C6 over the SDIO OTA plane), resets
+//                       the C6 or holds it in its ROM downloader for a UART
+//                       reflash, and reads / writes files in ota_fs_dir. P4
+//                       updates need a two-slot partition table; a new P4 image
+//                       is kept once it is reached over the network.
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -41,7 +43,12 @@ typedef struct {
     // about one SDIO write per tick under load.
     int dplane_task_prio;
     uint32_t dplane_send_timeout_ms;  // wait for a free C6 buffer, then drop
-    uint16_t http_port;               // 0 = no HTTP server
+    uint16_t ota_port;                // udp_ota, 0 = none
+    const char *ota_fs_dir;           // udp_ota file access (e.g. a mounted config partition), NULL = none
+    // Called with true while an image comes in or the C6 is written, false
+    // after (e.g. to pause video); NULL = none. Runs on udp_ota's tasks.
+    void (*on_ota_active)(bool active, void *ctx);
+    void *ota_ctx;
     // Queue d-plane, NULL = UDP dplane_port. The host registers both queues
     // (bfc::cv_reactor_circular_lossy_queue_registry<bfc::shared_sized_buffer>)
     // and the bfc::cv_reactor<> (bfc::cv_reactor_registry), and runs the
@@ -55,7 +62,8 @@ typedef struct {
     {                                                                               \
         .link = SDIO_LINK_HOST_CONFIG_DEFAULT(), .mplane_port = 22,                 \
         .dplane_port = 9000, .mplane_task_prio = 10, .dplane_task_prio = 15,        \
-        .dplane_send_timeout_ms = 20, .http_port = 80, .dplane_tx_queue = NULL,     \
+        .dplane_send_timeout_ms = 20, .ota_port = 3232, .ota_fs_dir = NULL,         \
+        .on_ota_active = NULL, .ota_ctx = NULL, .dplane_tx_queue = NULL,            \
         .dplane_rx_queue = NULL, .dplane_reactor = NULL,                            \
     }
 

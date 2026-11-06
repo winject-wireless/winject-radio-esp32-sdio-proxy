@@ -24,5 +24,6 @@ endif()
 set(WINJECT_SDIO_PROXY_COMPONENT_DIRS
     ${winject_radio_esp32c6_SOURCE_DIR}/components/sdio_msg
     ${WINJECT_SDIO_PROXY_ROOT}/components/sdio_link_host
+    ${WINJECT_SDIO_PROXY_ROOT}/components/udp_ota
     ${WINJECT_SDIO_PROXY_ROOT}/components/winject_proxy
 )
