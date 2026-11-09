@@ -6,7 +6,7 @@ endif()
 
 idf_component_register(SRCS "winject_proxy.c" "mplane_route.c" "dplane_queue.cpp"
                        INCLUDE_DIRS "include"
-                       PRIV_INCLUDE_DIRS ${bfc_SOURCE_DIR}/src
+                       PRIV_INCLUDE_DIRS ${BFC_INCLUDE_DIRS}
                        REQUIRES sdio_link_host
                        PRIV_REQUIRES udp_ota lwip freertos log esp_system pthread)
 
