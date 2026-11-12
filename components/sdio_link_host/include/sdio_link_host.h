@@ -23,6 +23,11 @@ typedef struct {
     int boot_gpio_ldo;   // on-chip LDO powering boot_gpio's IO domain (enabled at 3.3 V); -1 = none
     int rx_task_prio;
     int rx_task_stack;
+    // Core for the receive task ("sdio_rx"), or -1 for no affinity. Unpinned
+    // at its high priority it lands on whichever core is free and preempts
+    // that core's d-plane consumer; pin it away from the thread that drains
+    // the forward queue when both are busy (one frame costs both of them).
+    int rx_task_core;
     int boot_timeout_ms; // how long to wait for the C6's slave to answer after reset
 } sdio_link_host_config_t;
 
@@ -35,7 +40,7 @@ typedef struct {
     {                                                                                       \
         .slot = 1, .clk = 18, .cmd = 19, .d0 = 14, .d1 = 15, .d2 = 16, .d3 = 17,            \
         .freq_khz = 20000, .reset_gpio = 54, .boot_gpio = 45, .boot_gpio_ldo = 4, .rx_task_prio = 20, .rx_task_stack = 4096,     \
-        .boot_timeout_ms = 5000,                                                            \
+        .rx_task_core = -1, .boot_timeout_ms = 5000,                                        \
     }
 
 typedef struct {
