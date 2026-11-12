@@ -14,7 +14,7 @@ set(WINJECT_SDIO_PROXY_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 
 FetchContent_Declare(winject_radio_esp32c6
     GIT_REPOSITORY https://github.com/winject-wireless/winject-radio-esp32c6.git
-    GIT_TAG c9ac62e726972be1895567d7568ebaff6e063b3c
+    GIT_TAG 12b8da8cb315a78984820c8f9ba199cc905c7056
 )
 FetchContent_GetProperties(winject_radio_esp32c6)
 if(NOT winject_radio_esp32c6_POPULATED)
