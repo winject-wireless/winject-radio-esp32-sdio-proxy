@@ -322,8 +322,9 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
         // the C6 answers (e.g. after it was reflashed over its UART).
         ESP_LOGW(TAG, "C6 not answering after %d ms (0x%x), link down", config->boot_timeout_ms, err);
     }
-    if (xTaskCreate(rx_task, "sdio_rx", config->rx_task_stack, NULL, config->rx_task_prio, NULL) !=
-        pdPASS) {
+    const BaseType_t core = config->rx_task_core < 0 ? tskNO_AFFINITY : (BaseType_t)config->rx_task_core;
+    if (xTaskCreatePinnedToCore(rx_task, "sdio_rx", config->rx_task_stack, NULL, config->rx_task_prio, NULL,
+                                core) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "host up: %d kHz (asked %d)", s_stats.real_freq_khz, config->freq_khz);
