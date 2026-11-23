@@ -14,6 +14,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
+#include "sdio_tx_ring.h"
 
 static const char *TAG = "sdio_link";
 
@@ -23,7 +24,10 @@ static const char *TAG = "sdio_link";
 // 512-byte block, and DMA buffers on the P4 must be cache-line aligned.
 #define READ_SIZE 8192
 #define DMA_ALIGN 64
-#define TX_BUF_SIZE SDIO_MSG_ALIGN4(SDIO_MSG_MAX_SIZE)
+// P4 -> C6 send queue (sdio_tx_ring.h): slots of one C6 receive buffer each,
+// written several at a time. TX_SLOTS bounds a write; the C6's free receive
+// buffers bound it too.
+#define TX_SLOTS 8
 
 static essl_handle_t s_essl;
 static sdmmc_card_t *s_card;
@@ -34,7 +38,16 @@ static atomic_bool s_up;
 // C6 held in its ROM downloader: recovery neither resets nor probes it.
 static atomic_bool s_download;
 static SemaphoreHandle_t s_lock;     // essl calls are not thread-safe
-static SemaphoreHandle_t s_tx_lock;  // owns s_tx
+// Send queue: senders append under s_ring_mux, the TX task writes runs of
+// slots. s_tx_space is given when slots are freed, s_tx_task notified when a
+// message is queued.
+static portMUX_TYPE s_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+static sdio_tx_ring_t s_ring;
+static uint16_t s_ring_msgs[TX_SLOTS];
+static uint32_t s_ring_bytes[TX_SLOTS];
+static SemaphoreHandle_t s_tx_space;
+static TaskHandle_t s_tx_task;
+static void tx_task(void *arg);
 // The receive task outranks senders; while one waits for the bus, the receive
 // task steps aside after each read until that send is done (s_rx_turn).
 static atomic_int s_tx_waiting;
@@ -43,7 +56,7 @@ static sdio_msg_cb_t s_cb;
 static void *s_ctx;
 static uint8_t *s_read;   // DMA target
 static uint8_t *s_parse;  // carried tail + read, when a message spans two reads
-static uint8_t *s_tx;
+static uint8_t *s_tx;  // TX_SLOTS * SLAVE_RX_BUF_SIZE, DMA
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 static sdio_link_host_stats_t s_stats;
 
@@ -73,6 +86,50 @@ static void pulse_reset(void)
     gpio_set_level(s_cfg.reset_gpio, 1);
 }
 
+// Above SDMMC_FREQ_DEFAULT the link runs in SDIO high-speed mode. If that does
+// not hold up (wiring, signal integrity), drop to SDMMC_FREQ_DEFAULT until the
+// P4 restarts: when a whole bring-up at the high clock fails after at least
+// HS_FAIL_MAX bus errors with the card enumerated (a C6 that is only booting
+// either does not enumerate or answers "not ready", and normally comes up
+// within the bring-up), or after HS_LOSS_MAX link losses within
+// HS_LOSS_WINDOW_MS (C6 reboots count too; three a minute is not normal
+// either). The link is the only way to reach a remote board, so a bad clock
+// must never leave it down.
+#define HS_FAIL_MAX 3
+#define HS_LOSS_MAX 3
+#define HS_LOSS_WINDOW_MS 60000
+static int s_hs_fails;
+static int s_hs_losses;
+static TickType_t s_hs_loss_at;
+
+static bool high_speed(void)
+{
+    return s_host.max_freq_khz > SDMMC_FREQ_DEFAULT;
+}
+
+static void drop_to_default_speed(const char *why)
+{
+    if (!high_speed()) {
+        return;
+    }
+    ESP_LOGW(TAG, "%d kHz unreliable (%s), falling back to %d kHz", s_host.max_freq_khz, why,
+             SDMMC_FREQ_DEFAULT);
+    s_host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    STAT_ADD(freq_fallbacks, 1);
+}
+
+// A bus error with the card enumerated (counted at the high clock only).
+static void hs_bus_error(void)
+{
+    if (high_speed()) {
+        s_hs_fails++;
+    }
+}
+
+// Bumped by each successful bring-up, under s_lock: a run of slots the TX task
+// took before it belongs to the C6 that went away and is not written.
+static uint32_t s_gen;
+
 // Enumerate the card and wait for the C6 firmware's ready register. After a C6
 // reset the card can enumerate against the ROM's slave, which the firmware then
 // re-initialises, so the whole sequence is retried. Caller holds s_lock.
@@ -80,6 +137,10 @@ static esp_err_t bring_up(int timeout_ms)
 {
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     esp_err_t err = ESP_ERR_TIMEOUT;
+    s_hs_fails = 0;
+    if (s_hs_losses >= HS_LOSS_MAX) {
+        drop_to_default_speed("link losses");
+    }
     while ((int32_t)(xTaskGetTickCount() - deadline) < 0) {
         if (s_essl) {
             essl_sdio_deinit_dev(s_essl);
@@ -98,20 +159,35 @@ static esp_err_t bring_up(int timeout_ms)
         }
         err = essl_init(s_essl, 1000);
         if (err != ESP_OK) {
+            hs_bus_error();
             continue;
         }
         for (int i = 0; i < 10; i++) {
             uint8_t v = 0;
             err = essl_read_reg(s_essl, SDIO_LINK_READY_REG, &v, 100);
             if (err != ESP_OK) {
+                hs_bus_error();
                 break;
             }
             if (v == SDIO_LINK_READY_VALUE) {
                 sdmmc_host_get_real_freq(s_cfg.slot, &s_stats.real_freq_khz);
+                // Whatever is still queued was meant for the C6 before.
+                uint32_t msgs, bytes;
+                taskENTER_CRITICAL(&s_ring_mux);
+                s_gen++;
+                sdio_tx_ring_count(&s_ring, s_ring.used, &msgs, &bytes);
+                sdio_tx_ring_clear(&s_ring);
+                taskEXIT_CRITICAL(&s_ring_mux);
+                if (msgs) {
+                    STAT_ADD(tx_errors, msgs);
+                }
                 return ESP_OK;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
+    }
+    if (s_hs_fails >= HS_FAIL_MAX) {
+        drop_to_default_speed("bring-up errors");
     }
     return err == ESP_OK ? ESP_ERR_TIMEOUT : err;
 }
@@ -121,6 +197,13 @@ static void link_lost(const char *why, esp_err_t err)
     if (atomic_exchange(&s_up, false)) {
         ESP_LOGW(TAG, "link lost (%s: 0x%x), re-initialising", why, err);
         STAT_ADD(link_downs, 1);
+        // Counted here, applied by the next bring-up (under s_lock).
+        const TickType_t now = xTaskGetTickCount();
+        if (now - s_hs_loss_at > pdMS_TO_TICKS(HS_LOSS_WINDOW_MS)) {
+            s_hs_losses = 0;
+            s_hs_loss_at = now;
+        }
+        s_hs_losses++;
     }
 }
 
@@ -251,15 +334,16 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
     s_cb = cb;
     s_ctx = ctx;
     s_lock = xSemaphoreCreateMutex();
-    s_tx_lock = xSemaphoreCreateMutex();
+    s_tx_space = xSemaphoreCreateBinary();
     s_rx_turn = xSemaphoreCreateBinary();
     s_read = heap_caps_aligned_alloc(DMA_ALIGN, READ_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     s_parse = malloc(SDIO_MSG_MAX_SIZE + READ_SIZE);
-    s_tx = heap_caps_aligned_alloc(DMA_ALIGN, TX_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_tx = heap_caps_aligned_alloc(DMA_ALIGN, TX_SLOTS * SLAVE_RX_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     s_card = calloc(1, sizeof(*s_card));
-    if (!s_lock || !s_tx_lock || !s_rx_turn || !s_read || !s_parse || !s_tx || !s_card) {
+    if (!s_lock || !s_tx_space || !s_rx_turn || !s_read || !s_parse || !s_tx || !s_card) {
         return ESP_ERR_NO_MEM;
     }
+    sdio_tx_ring_init(&s_ring, s_tx, s_ring_msgs, s_ring_bytes, TX_SLOTS, SLAVE_RX_BUF_SIZE);
 
     s_cfg = *config;
     if (config->reset_gpio >= 0) {
@@ -312,6 +396,13 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
     host.max_freq_khz = config->freq_khz;
     s_host = host;
 
+    // The TX task exists before the link is up: senders notify it as soon
+    // as s_up is set.
+    const BaseType_t tx_core = config->tx_task_core < 0 ? tskNO_AFFINITY : (BaseType_t)config->tx_task_core;
+    if (xTaskCreatePinnedToCore(tx_task, "sdio_tx", config->tx_task_stack, NULL, config->tx_task_prio, &s_tx_task,
+                                tx_core) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     err = bring_up(config->boot_timeout_ms);
     xSemaphoreGive(s_lock);
@@ -337,46 +428,131 @@ esp_err_t sdio_link_host_send(uint8_t plane, const void *payload, uint16_t len, 
         STAT_ADD(tx_errors, 1);
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
-    const size_t size = sdio_msg_encode(s_tx, plane, payload, len);
-    if (size == 0) {
-        xSemaphoreGive(s_tx_lock);
+    if (len > SDIO_MSG_MAX_PAYLOAD || SDIO_MSG_SIZE(len) > SLAVE_RX_BUF_SIZE) {
         return ESP_ERR_INVALID_ARG;
     }
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    esp_err_t err;
     for (;;) {
-        // essl checks the slave's free buffers against its cached count and
-        // reads the register only when that runs short: ESP_ERR_NOT_FOUND
-        // means the C6 has no buffer yet. Wait without holding the bus so the
-        // receive task keeps draining the C6, which may itself be waiting to
-        // send to us.
-        atomic_fetch_add(&s_tx_waiting, 1);
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        err = essl_send_packet(s_essl, s_tx, size, 0);
-        xSemaphoreGive(s_lock);
-        atomic_fetch_sub(&s_tx_waiting, 1);
-        xSemaphoreGive(s_rx_turn);
-        if (err != ESP_ERR_NOT_FOUND) {
-            break;
+        // Encoding into the slot under the spinlock is one copy of at most
+        // a slot; it keeps the queue in send order without a second copy.
+        taskENTER_CRITICAL(&s_ring_mux);
+        const sdio_tx_ring_put_result_t put = sdio_tx_ring_put(&s_ring, plane, payload, len);
+        taskEXIT_CRITICAL(&s_ring_mux);
+        if (put == SDIO_TX_RING_QUEUED) {
+            xTaskNotifyGive(s_tx_task);
+            return ESP_OK;
         }
-        STAT_ADD(tx_credit_waits, 1);
-        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
-            err = ESP_ERR_TIMEOUT;
-            break;
+        if (put == SDIO_TX_RING_INVALID) {
+            return ESP_ERR_INVALID_ARG;  // unknown plane
         }
-        vTaskDelay(1);
+        if ((int32_t)(deadline - xTaskGetTickCount()) <= 0) {
+            STAT_ADD(tx_errors, 1);
+            return ESP_ERR_TIMEOUT;
+        }
+        // Woken when the TX task frees slots; a tick at most, since several
+        // senders may wait on one wake-up.
+        xSemaphoreTake(s_tx_space, 1);
+        if (!atomic_load(&s_up)) {
+            STAT_ADD(tx_errors, 1);
+            return ESP_ERR_INVALID_STATE;
+        }
     }
-    xSemaphoreGive(s_tx_lock);
-    if (err == ESP_OK) {
-        taskENTER_CRITICAL(&s_stats_mux);
-        s_stats.tx_msgs++;
-        s_stats.tx_bytes += len;
-        taskEXIT_CRITICAL(&s_stats_mux);
-    } else {
-        STAT_ADD(tx_errors, 1);
+}
+
+// Drops everything queued (the C6 went away); counted as send errors.
+static void drop_queued(void)
+{
+    uint32_t msgs, bytes;
+    taskENTER_CRITICAL(&s_ring_mux);
+    sdio_tx_ring_count(&s_ring, s_ring.used, &msgs, &bytes);
+    sdio_tx_ring_clear(&s_ring);
+    taskEXIT_CRITICAL(&s_ring_mux);
+    if (msgs) {
+        STAT_ADD(tx_errors, msgs);
     }
-    return err;
+    xSemaphoreGive(s_tx_space);
+}
+
+// TX task: writes every queued slot it can in one host write (the C6's free
+// receive buffers permitting), so a burst of messages costs one CMD53 instead
+// of one or two per message.
+static void tx_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        for (;;) {
+            if (!atomic_load(&s_up)) {
+                drop_queued();
+                break;
+            }
+            uint16_t first, n;
+            taskENTER_CRITICAL(&s_ring_mux);
+            n = sdio_tx_ring_take(&s_ring, TX_SLOTS, &first);
+            const uint32_t gen = s_gen;
+            taskEXIT_CRITICAL(&s_ring_mux);
+            if (n == 0) {
+                break;
+            }
+            // While we wait for the bus, the receive task reads about one
+            // buffer at a time so the directions alternate.
+            atomic_fetch_add(&s_tx_waiting, 1);
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            if (gen != s_gen || !atomic_load(&s_up)) {
+                // The C6 was reset or re-enumerated while this run waited for
+                // the bus: the bring-up dropped it (or the link is down and
+                // the next pass drops it).
+                xSemaphoreGive(s_lock);
+                atomic_fetch_sub(&s_tx_waiting, 1);
+                xSemaphoreGive(s_rx_turn);
+                continue;
+            }
+            esp_err_t err = essl_send_packet(s_essl, s_tx + (size_t)first * SLAVE_RX_BUF_SIZE,
+                                             (size_t)n * SLAVE_RX_BUF_SIZE, 0);
+            if (err == ESP_ERR_NOT_FOUND) {
+                // Fewer free C6 buffers than slots: send what fits.
+                uint32_t free_bufs = 0;
+                err = essl_get_tx_buffer_num(s_essl, &free_bufs, 0);
+                if (err == ESP_OK && free_bufs > 0) {
+                    n = (uint16_t)(free_bufs < n ? free_bufs : n);
+                    err = essl_send_packet(s_essl, s_tx + (size_t)first * SLAVE_RX_BUF_SIZE,
+                                           (size_t)n * SLAVE_RX_BUF_SIZE, 0);
+                } else if (err == ESP_OK) {
+                    err = ESP_ERR_NOT_FOUND;
+                }
+            }
+            uint32_t msgs = 0, bytes = 0;
+            if (err != ESP_ERR_NOT_FOUND) {
+                // Released before s_lock is given, so a bring-up (which clears
+                // the queue under s_lock) never sees a written run as queued.
+                taskENTER_CRITICAL(&s_ring_mux);
+                sdio_tx_ring_count(&s_ring, n, &msgs, &bytes);
+                sdio_tx_ring_release(&s_ring, n);
+                taskEXIT_CRITICAL(&s_ring_mux);
+            }
+            xSemaphoreGive(s_lock);
+            atomic_fetch_sub(&s_tx_waiting, 1);
+            xSemaphoreGive(s_rx_turn);
+            if (err == ESP_ERR_NOT_FOUND) {
+                // No C6 buffer free yet; the open slot was closed by take,
+                // which only costs packing for this wait.
+                STAT_ADD(tx_credit_waits, 1);
+                vTaskDelay(1);
+                continue;
+            }
+            xSemaphoreGive(s_tx_space);
+            if (err == ESP_OK) {
+                taskENTER_CRITICAL(&s_stats_mux);
+                s_stats.tx_msgs += msgs;
+                s_stats.tx_bytes += bytes;
+                s_stats.tx_writes++;
+                s_stats.tx_slots += n;
+                taskEXIT_CRITICAL(&s_stats_mux);
+            } else {
+                STAT_ADD(tx_errors, msgs);
+                link_lost("write", err);
+            }
+        }
+    }
 }
 
 bool sdio_link_host_is_up(void)

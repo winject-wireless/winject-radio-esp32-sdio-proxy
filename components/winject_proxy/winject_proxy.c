@@ -7,6 +7,7 @@
 #include "dplane_queue.h"
 #include "esp_log.h"
 #include "mplane_route.h"
+#include "sdio_test_peer.h"
 #include "udp_ota.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -86,6 +87,10 @@ static void on_link_message(void *ctx, uint8_t plane, const uint8_t *payload, ui
 {
     if (plane == SDIO_MSG_PLANE_OTA) {
         udp_ota_on_c6_reply(payload, len);
+        return;
+    }
+    if (plane == SDIO_MSG_PLANE_TEST) {
+        sdio_test_peer_on_message(payload, len);
         return;
     }
     if (plane == SDIO_MSG_PLANE_MPLANE) {
@@ -269,7 +274,13 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
             return ESP_FAIL;
         }
     }
-    esp_err_t err = sdio_link_host_start(&config->link, on_link_message, NULL);
+    // SDIO bandwidth test peer (driven from the C6's m-plane `test_sdio`).
+    // Optional: the link must come up without it.
+    esp_err_t err = sdio_test_peer_start(config->dplane_task_prio);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SDIO test peer not started (%s)", esp_err_to_name(err));
+    }
+    err = sdio_link_host_start(&config->link, on_link_message, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SDIO link: 0x%x", err);
         return err;
