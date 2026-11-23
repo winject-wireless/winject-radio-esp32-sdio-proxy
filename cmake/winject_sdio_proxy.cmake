@@ -4,7 +4,8 @@
 #   include(<this repo>/cmake/winject_sdio_proxy.cmake)
 #   list(APPEND EXTRA_COMPONENT_DIRS ${WINJECT_SDIO_PROXY_COMPONENT_DIRS})
 #
-# sdio_msg (the SDIO wire format) lives with the C6 firmware in
+# sdio_msg (the SDIO wire format) and sdio_test_meter (CPU / memory figures of
+# the SDIO bandwidth test) live with the C6 firmware in
 # winject-radio-esp32c6, so both ends of the link build from one copy.
 # Override the checkout with -DFETCHCONTENT_SOURCE_DIR_WINJECT_RADIO_ESP32C6=<dir>.
 include_guard(GLOBAL)
@@ -23,6 +24,7 @@ endif()
 
 set(WINJECT_SDIO_PROXY_COMPONENT_DIRS
     ${winject_radio_esp32c6_SOURCE_DIR}/components/sdio_msg
+    ${winject_radio_esp32c6_SOURCE_DIR}/components/sdio_test_meter
     ${WINJECT_SDIO_PROXY_ROOT}/components/sdio_link_host
     ${WINJECT_SDIO_PROXY_ROOT}/components/udp_ota
     ${WINJECT_SDIO_PROXY_ROOT}/components/winject_proxy

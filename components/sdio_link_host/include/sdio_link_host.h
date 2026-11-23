@@ -17,6 +17,8 @@ extern "C" {
 typedef struct {
     int slot;            // SDMMC host slot
     int clk, cmd, d0, d1, d2, d3;  // pins (used where the slot routes through the GPIO matrix)
+    // SDIO clock. Above 20000 (SDMMC_FREQ_DEFAULT) the card runs in high-speed
+    // mode; the link falls back to 20000 if that mode errors (see stats).
     int freq_khz;
     int reset_gpio;      // C6 CHIP_PU, pulsed low at start; -1 = none
     int boot_gpio;       // C6 GPIO9 strap: low during reset = ROM downloader; -1 = none
@@ -29,6 +31,11 @@ typedef struct {
     // the forward queue when both are busy (one frame costs both of them).
     int rx_task_core;
     int boot_timeout_ms; // how long to wait for the C6's slave to answer after reset
+    // TX task ("sdio_tx"): writes the send queue to the C6, several messages
+    // per host write. Core -1 = no affinity.
+    int tx_task_prio;
+    int tx_task_stack;
+    int tx_task_core;
 } sdio_link_host_config_t;
 
 // P4 + C6 boards (Waveshare ESP32-P4-WIFI6-DEV-KIT, Guition JC-ESP32P4-M3-DEV):
@@ -39,15 +46,18 @@ typedef struct {
 #define SDIO_LINK_HOST_CONFIG_DEFAULT()                                                     \
     {                                                                                       \
         .slot = 1, .clk = 18, .cmd = 19, .d0 = 14, .d1 = 15, .d2 = 16, .d3 = 17,            \
-        .freq_khz = 20000, .reset_gpio = 54, .boot_gpio = 45, .boot_gpio_ldo = 4, .rx_task_prio = 20, .rx_task_stack = 4096,     \
-        .rx_task_core = -1, .boot_timeout_ms = 5000,                                        \
+        .freq_khz = 40000, .reset_gpio = 54, .boot_gpio = 45, .boot_gpio_ldo = 4, .rx_task_prio = 20, .rx_task_stack = 4096,     \
+        .rx_task_core = -1, .boot_timeout_ms = 5000, .tx_task_prio = 20, .tx_task_stack = 3072, \
+        .tx_task_core = -1,                                                                 \
     }
 
 typedef struct {
     uint32_t rx_msgs, rx_bytes, rx_bad, rx_reads, rx_errors;
-    uint32_t tx_msgs, tx_bytes, tx_errors;
+    uint32_t tx_msgs, tx_bytes, tx_errors;  // tx_errors: not queued in time, link down, or write failed
+    uint32_t tx_writes, tx_slots;  // host writes to the C6, and C6 buffers they filled
     uint32_t tx_credit_waits;  // sends that found no free C6 buffer and slept a tick
     uint32_t link_downs, link_ups;  // C6 lost (reboot, reset) / link re-established
+    uint32_t freq_fallbacks;  // high-speed clock given up for SDMMC_FREQ_DEFAULT
     int real_freq_khz;
 } sdio_link_host_stats_t;
 
@@ -79,9 +89,11 @@ esp_err_t sdio_link_host_enter_download(void);
 // true between sdio_link_host_enter_download() and the next reset_c6().
 bool sdio_link_host_in_download(void);
 
-// Send one message to the C6. Fails with ESP_ERR_INVALID_STATE while the link
-// is down. Blocks up to `timeout_ms` for a free slave
-// receive buffer. Safe from several tasks.
+// Queue one message for the C6 (copied). The TX task writes queued messages
+// several at a time, in order; ESP_OK means queued. Fails with
+// ESP_ERR_INVALID_STATE while the link is down, ESP_ERR_TIMEOUT when the queue
+// stays full for `timeout_ms` (the C6 not taking data). Messages still queued
+// when the link goes down are dropped (tx_errors). Safe from several tasks.
 esp_err_t sdio_link_host_send(uint8_t plane, const void *payload, uint16_t len, uint32_t timeout_ms);
 
 void sdio_link_host_get_stats(sdio_link_host_stats_t *out);

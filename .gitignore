@@ -17,3 +17,4 @@ Thumbs.db
 __pycache__/
 scripts/.venv/
 build/
+aidocs/

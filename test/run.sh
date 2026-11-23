@@ -11,6 +11,17 @@ cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   "$repo_dir/components/winject_proxy/mplane_route.c" \
   -o "$build_dir/mplane_route_test"
 
+# P4 -> C6 send queue; sdio_msg comes from winject-radio-esp32c6
+# (WINJECT_C6_ROOT, default the sibling checkout).
+c6_root=${WINJECT_C6_ROOT:-$repo_dir/../winject-radio-esp32c6}
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -I"$repo_dir/components/sdio_link_host" -I"$c6_root/components/sdio_msg/include" \
+  "$repo_dir/test/sdio_tx_ring_test.c" \
+  "$repo_dir/components/sdio_link_host/sdio_tx_ring.c" \
+  "$c6_root/components/sdio_msg/sdio_msg.c" \
+  -o "$build_dir/sdio_tx_ring_test"
+"$build_dir/sdio_tx_ring_test"
+
 "$build_dir/mplane_route_test"
 
 # udp_ota core (components/udp_ota/core): unit tests, and a host server for
