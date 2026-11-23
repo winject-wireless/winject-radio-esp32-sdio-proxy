@@ -275,9 +275,10 @@ esp_err_t winject_proxy_start(const winject_proxy_config_t *config)
         }
     }
     // SDIO bandwidth test peer (driven from the C6's m-plane `test_sdio`).
+    // Optional: the link must come up without it.
     esp_err_t err = sdio_test_peer_start(config->dplane_task_prio);
     if (err != ESP_OK) {
-        return err;
+        ESP_LOGW(TAG, "SDIO test peer not started (%s)", esp_err_to_name(err));
     }
     err = sdio_link_host_start(&config->link, on_link_message, NULL);
     if (err != ESP_OK) {

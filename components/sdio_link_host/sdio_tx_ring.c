@@ -20,36 +20,38 @@ static uint8_t *slot(const sdio_tx_ring_t *r, uint16_t i)
     return r->mem + (size_t)i * r->slot_size;
 }
 
-bool sdio_tx_ring_put(sdio_tx_ring_t *r, uint8_t plane, const void *payload, uint16_t len)
+sdio_tx_ring_put_result_t sdio_tx_ring_put(sdio_tx_ring_t *r, uint8_t plane, const void *payload, uint16_t len)
 {
     const size_t size = SDIO_MSG_SIZE(len);
     if (len > SDIO_MSG_MAX_PAYLOAD || size > r->slot_size) {
-        return false;
+        return SDIO_TX_RING_INVALID;
     }
-    if (!r->open || r->fill + size > r->slot_size) {
-        if (r->used == r->slots) {
-            return false;
-        }
-        const uint16_t i = (uint16_t)((r->head + r->used) % r->slots);
+    const bool new_slot = !r->open || r->fill + size > r->slot_size;
+    if (new_slot && r->used == r->slots) {
+        return SDIO_TX_RING_FULL;
+    }
+    const uint16_t i = (uint16_t)((r->head + r->used - (new_slot ? 0 : 1)) % r->slots);
+    const uint16_t at = new_slot ? 0 : r->fill;
+    uint8_t *p = slot(r, i) + at;
+    // Encoded before the slot is taken; sdio_msg_encode writes nothing when
+    // it rejects a message (unknown plane), so the queue stays as it was.
+    if (sdio_msg_encode(p, plane, payload, len) != size) {
+        return SDIO_TX_RING_INVALID;
+    }
+    if (new_slot) {
         r->used++;
         r->open = true;
-        r->fill = 0;
         r->msgs[i] = 0;
         r->bytes[i] = 0;
     }
-    const uint16_t i = (uint16_t)((r->head + r->used - 1) % r->slots);
-    uint8_t *p = slot(r, i) + r->fill;
-    if (sdio_msg_encode(p, plane, payload, len) != size) {
-        return false;
-    }
-    r->fill = (uint16_t)(r->fill + size);
+    r->fill = (uint16_t)(at + size);
     r->msgs[i]++;
     r->bytes[i] += len;
     // End the buffer here unless the message filled it.
     if (r->fill + SDIO_MSG_HDR_LEN <= r->slot_size) {
         memset(p + size, 0, SDIO_MSG_HDR_LEN);
     }
-    return true;
+    return SDIO_TX_RING_QUEUED;
 }
 
 uint16_t sdio_tx_ring_take(sdio_tx_ring_t *r, uint16_t max, uint16_t *first)

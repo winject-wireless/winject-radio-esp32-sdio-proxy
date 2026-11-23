@@ -88,9 +88,13 @@ static void pulse_reset(void)
 
 // Above SDMMC_FREQ_DEFAULT the link runs in SDIO high-speed mode. If that does
 // not hold up (wiring, signal integrity), drop to SDMMC_FREQ_DEFAULT until the
-// P4 restarts: after HS_FAIL_MAX bus errors while enumerated at the high clock,
-// or HS_LOSS_MAX link losses within HS_LOSS_WINDOW_MS. The link is the only
-// way to reach a remote board, so a bad clock must never leave it down.
+// P4 restarts: when a whole bring-up at the high clock fails after at least
+// HS_FAIL_MAX bus errors with the card enumerated (a C6 that is only booting
+// either does not enumerate or answers "not ready", and normally comes up
+// within the bring-up), or after HS_LOSS_MAX link losses within
+// HS_LOSS_WINDOW_MS (C6 reboots count too; three a minute is not normal
+// either). The link is the only way to reach a remote board, so a bad clock
+// must never leave it down.
 #define HS_FAIL_MAX 3
 #define HS_LOSS_MAX 3
 #define HS_LOSS_WINDOW_MS 60000
@@ -114,13 +118,17 @@ static void drop_to_default_speed(const char *why)
     STAT_ADD(freq_fallbacks, 1);
 }
 
-// A bus error with the card enumerated at the high clock.
+// A bus error with the card enumerated (counted at the high clock only).
 static void hs_bus_error(void)
 {
-    if (high_speed() && ++s_hs_fails >= HS_FAIL_MAX) {
-        drop_to_default_speed("bring-up errors");
+    if (high_speed()) {
+        s_hs_fails++;
     }
 }
+
+// Bumped by each successful bring-up, under s_lock: a run of slots the TX task
+// took before it belongs to the C6 that went away and is not written.
+static uint32_t s_gen;
 
 // Enumerate the card and wait for the C6 firmware's ready register. After a C6
 // reset the card can enumerate against the ROM's slave, which the firmware then
@@ -163,10 +171,23 @@ static esp_err_t bring_up(int timeout_ms)
             }
             if (v == SDIO_LINK_READY_VALUE) {
                 sdmmc_host_get_real_freq(s_cfg.slot, &s_stats.real_freq_khz);
+                // Whatever is still queued was meant for the C6 before.
+                uint32_t msgs, bytes;
+                taskENTER_CRITICAL(&s_ring_mux);
+                s_gen++;
+                sdio_tx_ring_count(&s_ring, s_ring.used, &msgs, &bytes);
+                sdio_tx_ring_clear(&s_ring);
+                taskEXIT_CRITICAL(&s_ring_mux);
+                if (msgs) {
+                    STAT_ADD(tx_errors, msgs);
+                }
                 return ESP_OK;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
+    }
+    if (s_hs_fails >= HS_FAIL_MAX) {
+        drop_to_default_speed("bring-up errors");
     }
     return err == ESP_OK ? ESP_ERR_TIMEOUT : err;
 }
@@ -375,6 +396,13 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
     host.max_freq_khz = config->freq_khz;
     s_host = host;
 
+    // The TX task exists before the link is up: senders notify it as soon
+    // as s_up is set.
+    const BaseType_t tx_core = config->tx_task_core < 0 ? tskNO_AFFINITY : (BaseType_t)config->tx_task_core;
+    if (xTaskCreatePinnedToCore(tx_task, "sdio_tx", config->tx_task_stack, NULL, config->tx_task_prio, &s_tx_task,
+                                tx_core) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     err = bring_up(config->boot_timeout_ms);
     xSemaphoreGive(s_lock);
@@ -388,11 +416,6 @@ esp_err_t sdio_link_host_start(const sdio_link_host_config_t *config, sdio_msg_c
     const BaseType_t core = config->rx_task_core < 0 ? tskNO_AFFINITY : (BaseType_t)config->rx_task_core;
     if (xTaskCreatePinnedToCore(rx_task, "sdio_rx", config->rx_task_stack, NULL, config->rx_task_prio, NULL,
                                 core) != pdPASS) {
-        return ESP_ERR_NO_MEM;
-    }
-    const BaseType_t tx_core = config->tx_task_core < 0 ? tskNO_AFFINITY : (BaseType_t)config->tx_task_core;
-    if (xTaskCreatePinnedToCore(tx_task, "sdio_tx", config->tx_task_stack, NULL, config->tx_task_prio, &s_tx_task,
-                                tx_core) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "host up: %d kHz (asked %d)", s_stats.real_freq_khz, config->freq_khz);
@@ -413,11 +436,14 @@ esp_err_t sdio_link_host_send(uint8_t plane, const void *payload, uint16_t len, 
         // Encoding into the slot under the spinlock is one copy of at most
         // a slot; it keeps the queue in send order without a second copy.
         taskENTER_CRITICAL(&s_ring_mux);
-        const bool queued = sdio_tx_ring_put(&s_ring, plane, payload, len);
+        const sdio_tx_ring_put_result_t put = sdio_tx_ring_put(&s_ring, plane, payload, len);
         taskEXIT_CRITICAL(&s_ring_mux);
-        if (queued) {
+        if (put == SDIO_TX_RING_QUEUED) {
             xTaskNotifyGive(s_tx_task);
             return ESP_OK;
+        }
+        if (put == SDIO_TX_RING_INVALID) {
+            return ESP_ERR_INVALID_ARG;  // unknown plane
         }
         if ((int32_t)(deadline - xTaskGetTickCount()) <= 0) {
             STAT_ADD(tx_errors, 1);
@@ -462,6 +488,7 @@ static void tx_task(void *arg)
             uint16_t first, n;
             taskENTER_CRITICAL(&s_ring_mux);
             n = sdio_tx_ring_take(&s_ring, TX_SLOTS, &first);
+            const uint32_t gen = s_gen;
             taskEXIT_CRITICAL(&s_ring_mux);
             if (n == 0) {
                 break;
@@ -470,6 +497,15 @@ static void tx_task(void *arg)
             // buffer at a time so the directions alternate.
             atomic_fetch_add(&s_tx_waiting, 1);
             xSemaphoreTake(s_lock, portMAX_DELAY);
+            if (gen != s_gen || !atomic_load(&s_up)) {
+                // The C6 was reset or re-enumerated while this run waited for
+                // the bus: the bring-up dropped it (or the link is down and
+                // the next pass drops it).
+                xSemaphoreGive(s_lock);
+                atomic_fetch_sub(&s_tx_waiting, 1);
+                xSemaphoreGive(s_rx_turn);
+                continue;
+            }
             esp_err_t err = essl_send_packet(s_essl, s_tx + (size_t)first * SLAVE_RX_BUF_SIZE,
                                              (size_t)n * SLAVE_RX_BUF_SIZE, 0);
             if (err == ESP_ERR_NOT_FOUND) {
@@ -484,6 +520,15 @@ static void tx_task(void *arg)
                     err = ESP_ERR_NOT_FOUND;
                 }
             }
+            uint32_t msgs = 0, bytes = 0;
+            if (err != ESP_ERR_NOT_FOUND) {
+                // Released before s_lock is given, so a bring-up (which clears
+                // the queue under s_lock) never sees a written run as queued.
+                taskENTER_CRITICAL(&s_ring_mux);
+                sdio_tx_ring_count(&s_ring, n, &msgs, &bytes);
+                sdio_tx_ring_release(&s_ring, n);
+                taskEXIT_CRITICAL(&s_ring_mux);
+            }
             xSemaphoreGive(s_lock);
             atomic_fetch_sub(&s_tx_waiting, 1);
             xSemaphoreGive(s_rx_turn);
@@ -494,11 +539,6 @@ static void tx_task(void *arg)
                 vTaskDelay(1);
                 continue;
             }
-            uint32_t msgs, bytes;
-            taskENTER_CRITICAL(&s_ring_mux);
-            sdio_tx_ring_count(&s_ring, n, &msgs, &bytes);
-            sdio_tx_ring_release(&s_ring, n);
-            taskEXIT_CRITICAL(&s_ring_mux);
             xSemaphoreGive(s_tx_space);
             if (err == ESP_OK) {
                 taskENTER_CRITICAL(&s_stats_mux);

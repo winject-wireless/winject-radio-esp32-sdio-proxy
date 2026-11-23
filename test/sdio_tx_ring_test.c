@@ -46,7 +46,7 @@ static void put(sdio_tx_ring_t *r, uint32_t id, uint16_t len, bool expect)
     uint8_t p[1504];
     memset(p, 0xee, sizeof(p));
     memcpy(p, &id, sizeof(id));
-    CHECK(sdio_tx_ring_put(r, SDIO_MSG_PLANE_DPLANE, p, len) == expect);
+    CHECK((sdio_tx_ring_put(r, SDIO_MSG_PLANE_DPLANE, p, len) == SDIO_TX_RING_QUEUED) == expect);
 }
 
 // Parses slots [first, first + n) one at a time, as the C6 does.
@@ -133,11 +133,38 @@ static void test_exact_fill(void)
     put(&r, 4, SDIO_MSG_MAX_PAYLOAD + 1, false);
 }
 
+static void test_rejected_plane(void)
+{
+    // An unknown plane is refused without taking a slot or touching the open
+    // one; a full queue says FULL, an oversized message INVALID.
+    sdio_tx_ring_t r;
+    memset(s_mem, 0xaa, sizeof(s_mem));
+    sdio_tx_ring_init(&r, s_mem, s_msgs, s_bytes, SLOTS, SLOT);
+    uint8_t p[1400] = {0};
+    CHECK(sdio_tx_ring_put(&r, 0x7f, p, 10) == SDIO_TX_RING_INVALID);
+    CHECK(r.used == 0 && !r.open);
+    put(&r, 1, 100, true);
+    CHECK(sdio_tx_ring_put(&r, 0x7f, p, 10) == SDIO_TX_RING_INVALID);
+    CHECK(r.used == 1 && r.fill == 104);
+    uint16_t first;
+    const uint16_t n = sdio_tx_ring_take(&r, 8, &first);
+    struct seen s = {0};
+    parse_slots(first, n, &s);
+    CHECK(s.n == 1 && s.id[0] == 1);
+    sdio_tx_ring_release(&r, n);
+    for (int i = 0; i < SLOTS; i++) {
+        put(&r, 10 + i, 1400, true);
+    }
+    CHECK(sdio_tx_ring_put(&r, SDIO_MSG_PLANE_DPLANE, p, 1400) == SDIO_TX_RING_FULL);
+    CHECK(sdio_tx_ring_put(&r, SDIO_MSG_PLANE_DPLANE, p, SLOT) == SDIO_TX_RING_INVALID);
+}
+
 int main(void)
 {
     test_pack_and_order();
     test_full_and_wrap();
     test_exact_fill();
+    test_rejected_plane();
     printf("sdio_tx_ring_test OK\n");
     return 0;
 }

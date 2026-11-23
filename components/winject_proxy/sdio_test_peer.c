@@ -29,7 +29,10 @@ typedef union {
 } control_t;
 
 static QueueHandle_t s_queue;
-static atomic_bool s_stop_tx;
+// Run whose bw_tx was stopped, | STOP_SET (0 = none). Scoped to the run, so a
+// stop followed at once by the next run's start still stops the running one.
+#define STOP_SET 0x10000u
+static atomic_uint s_stop_run;
 
 // C6 -> P4 test packets (link receive task writes, peer task reads / resets).
 static portMUX_TYPE s_rx_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -57,11 +60,13 @@ void sdio_test_peer_on_message(const uint8_t *payload, uint16_t len)
         memcpy(&c.bw_tx, payload, sizeof(c.bw_tx));
         if (c.bw_tx.count == 0) {
             // Stop: the peer task is busy sending, so flag it from here.
-            atomic_store(&s_stop_tx, true);
+            atomic_store(&s_stop_run, c.bw_tx.run | STOP_SET);
             return;
         }
-        // In order with the stops: one that follows this start counts.
-        atomic_store(&s_stop_tx, false);
+        // A stale stop of this run id (ids wrap) must not stop the new run;
+        // a stop that follows this start still counts.
+        unsigned int stale = c.bw_tx.run | STOP_SET;
+        atomic_compare_exchange_strong(&s_stop_run, &stale, 0);
     } else if (type == SDIO_TEST_GET_RX_STATS && len >= sizeof(c.get)) {
         memcpy(&c.get, payload, sizeof(c.get));
     } else {
@@ -120,7 +125,7 @@ static void run_bw_tx(const sdio_test_bw_tx_t *req)
     }
     const int64_t t0 = esp_timer_get_time();
     int64_t next = t0;
-    for (uint32_t seq = 0; seq < req->count && !atomic_load(&s_stop_tx); seq++) {
+    for (uint32_t seq = 0; seq < req->count && atomic_load(&s_stop_run) != (req->run | STOP_SET); seq++) {
         pace(&next, req->pacing_us);
         sdio_test_packet_set(buf, req->run, seq);
         if (sdio_link_host_send(SDIO_MSG_PLANE_TEST, buf, mtu, SEND_TIMEOUT_MS) == ESP_OK) {
@@ -138,7 +143,7 @@ static void run_bw_tx(const sdio_test_bw_tx_t *req)
 
 static void answer_get(const sdio_test_get_rx_stats_t *req)
 {
-    sdio_test_rx_stats_t r = {.type = SDIO_TEST_RX_STATS, .run = req->run};
+    sdio_test_rx_stats_t r = {.type = SDIO_TEST_RX_STATS, .tag = req->tag, .run = req->run};
     taskENTER_CRITICAL(&s_rx_mux);
     r.rx = s_rx.c;
     taskEXIT_CRITICAL(&s_rx_mux);

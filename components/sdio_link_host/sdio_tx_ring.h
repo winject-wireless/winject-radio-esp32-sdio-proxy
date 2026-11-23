@@ -35,9 +35,14 @@ typedef struct {
 void sdio_tx_ring_init(sdio_tx_ring_t *r, uint8_t *mem, uint16_t *msgs, uint32_t *bytes, uint16_t slots,
                        uint16_t slot_size);
 
-// Appends one message. false: no room (all slots used, the open one too full)
-// or the message is larger than a slot / invalid.
-bool sdio_tx_ring_put(sdio_tx_ring_t *r, uint8_t plane, const void *payload, uint16_t len);
+typedef enum {
+    SDIO_TX_RING_QUEUED,
+    SDIO_TX_RING_FULL,     // all slots used and the open one too full: retry later
+    SDIO_TX_RING_INVALID,  // unknown plane, or larger than a slot: never fits
+} sdio_tx_ring_put_result_t;
+
+// Appends one message; the queue is unchanged unless it was queued.
+sdio_tx_ring_put_result_t sdio_tx_ring_put(sdio_tx_ring_t *r, uint8_t plane, const void *payload, uint16_t len);
 
 // The run of slots to write next: up to `max` slots from the head, contiguous
 // in memory (not past the ring's end). The open slot, if in the run, is closed.
